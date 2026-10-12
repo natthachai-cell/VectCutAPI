@@ -387,3 +387,49 @@ def test_localize_material_sources_keeps_real_urls(tmp_path):
     data = json.loads((tmp_path / "draft_info.json").read_text(encoding="utf-8"))
     assert data["materials"]["videos"][0]["remote_url"] == "/proj/assets/video/a.mp4"
     assert data["materials"]["audios"][0]["remote_url"] == "https://example.com/b.mp3"
+
+
+def _exported_video_tracks(draft_id):
+    from draft_cache import DRAFT_CACHE
+
+    exported = json.loads(DRAFT_CACHE[draft_id].dumps())["tracks"]
+    return [(track["name"], [(seg["target_timerange"]["start"], seg["target_timerange"]["duration"])
+                             for seg in track["segments"]])
+            for track in exported if track["type"] == "video"]
+
+
+def _add_clip(draft_id=None, target_start=0, seconds=3):
+    from add_video_track import add_video_track
+
+    return add_video_track(draft_id=draft_id, video_url="https://example.com/clip.mp4", start=0, end=seconds,
+                           duration=float(seconds), target_start=target_start, track_name="video_main")["draft_id"]
+
+
+def test_single_clip_at_zero_exports_no_empty_video_track():
+    from draft_cache import DRAFT_CACHE
+
+    draft_id = _add_clip()
+
+    assert _exported_video_tracks(draft_id) == [("video_main", [(0, 3000000)])]
+    # The placeholder stays on the draft, so later clips can still bring it back
+    assert "video" in DRAFT_CACHE[draft_id].tracks
+
+
+def test_contiguous_clips_export_no_empty_video_track():
+    draft_id = _add_clip()
+    _add_clip(draft_id, target_start=3, seconds=2)
+
+    assert _exported_video_tracks(draft_id) == [("video_main", [(0, 3000000), (3000000, 2000000)])]
+
+
+def test_gap_keeps_empty_bottom_track_so_capcut_keeps_positions():
+    draft_id = _add_clip()
+    _add_clip(draft_id, target_start=6, seconds=1)
+
+    assert _exported_video_tracks(draft_id) == [("video", []), ("video_main", [(0, 3000000), (6000000, 1000000)])]
+
+
+def test_clip_not_at_zero_keeps_empty_bottom_track():
+    draft_id = _add_clip(target_start=2)
+
+    assert _exported_video_tracks(draft_id) == [("video", []), ("video_main", [(2000000, 3000000)])]
