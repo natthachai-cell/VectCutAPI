@@ -15,3 +15,5 @@ config.json
 .venv/
 venv/
 tmp/
+# Project folders moved aside by /save_draft overwrite=true
+capcut_backups/

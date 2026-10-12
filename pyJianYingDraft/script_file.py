@@ -20,7 +20,7 @@ from .text_segment import Text_segment, Text_style, TextBubble, Text_border, Tex
 from .track import Track_type, Base_track, Track
 
 from settings.local import IS_CAPCUT_ENV
-from draft_profiles import get_draft_profile
+from draft_profiles import get_draft_profile, new_draft_id
 from .metadata import Video_scene_effect_type, Video_character_effect_type, Filter_type, Font_type
 
 class Script_material:
@@ -209,6 +209,9 @@ class Script_file:
 
         with open(os.path.join(os.path.dirname(__file__), self.TEMPLATE_FILE), "r", encoding="utf-8") as f:
             self.content = json.load(f)
+        # The template carries a fixed id; each new draft needs its own timeline id.
+        # load_template() replaces content afterwards, so existing drafts keep theirs.
+        self.content["id"] = new_draft_id()
 
     @staticmethod
     def load_template(json_path: str) -> "Script_file":
@@ -879,6 +882,28 @@ class Script_file:
             if effect["type"] == "text_effect":
                 print("\tResource id: %s '%s'" % (effect["resource_id"], effect.get("name", "")))
 
+    def _without_redundant_main_placeholder(self, track_list: List[Base_track]) -> List[Base_track]:
+        """Leave out the empty default video track when the main track would not move any clip.
+
+        add_video/add_image put an empty unnamed video track at the bottom so that CapCut, which
+        snaps clips on its bottom ("main") track to 0 and closes gaps, keeps clip positions.
+        When the next video track already starts at 0 with no gaps, that placeholder only leaves
+        CapCut's main track empty, so it is not exported. The track stays in self.tracks.
+        """
+        video_tracks = [track for track in track_list
+                        if isinstance(track, Track) and track.track_type == Track_type.video]
+        if self.imported_tracks or len(video_tracks) < 2:
+            return track_list
+        placeholder, main = video_tracks[0], video_tracks[1]
+        if placeholder.name != Track_type.video.name or placeholder.segments or not main.segments:
+            return track_list
+        position = 0
+        for segment in sorted(main.segments, key=lambda seg: seg.target_timerange.start):
+            if segment.target_timerange.start != position:
+                return track_list
+            position = segment.target_timerange.end
+        return [track for track in track_list if track is not placeholder]
+
     def dumps(self, profile=None) -> str:
         """将草稿文件内容导出为JSON字符串"""
         if profile is None:
@@ -904,6 +929,7 @@ class Script_file:
         track_list: List[Base_track] = list(self.tracks.values())
         track_list.extend(self.imported_tracks)
         track_list.sort(key=lambda track: track.render_index)
+        track_list = self._without_redundant_main_placeholder(track_list)
         self.content["tracks"] = [track.export_json() for track in track_list]
 
         return json.dumps(self.content, ensure_ascii=False, indent=4)

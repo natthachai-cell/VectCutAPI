@@ -20,7 +20,8 @@ import requests # Import requests for making HTTP calls
 import logging
 # Import configuration
 from settings import IS_UPLOAD_DRAFT
-from draft_profiles import get_draft_profile, write_profile_content
+from draft_profiles import (get_draft_profile, write_profile_content, assign_new_draft_ids, set_draft_meta_location,
+                            relocate_draft_paths, localize_material_sources, find_draft_paths)
 
 # --- Get your Logger instance ---
 # The name here must match the logger name you configured in app.py
@@ -40,7 +41,56 @@ def build_asset_path(draft_folder: str, draft_id: str, asset_type: str, material
     """
     return build_draft_asset_path(draft_folder, draft_id, asset_type, material_name)
 
-def save_draft_background(draft_id, draft_folder, task_id, project_name=None, auto_deploy=True):
+def get_capcut_projects_dir():
+    """Return the CapCut desktop drafts folder on this machine, or None."""
+    if os.name == 'nt':
+        candidates = [os.path.expandvars(r"%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft")]
+    else:
+        candidates = [
+            os.path.expanduser('~/Movies/CapCut/User Data/Projects/com.lveditor.draft'),
+            os.path.expanduser('~/Library/Containers/com.lemon.lvpro/Data/Documents/JianyingPro/User Data/Projects/com.lveditor.draft'),
+        ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return None
+
+def get_deploy_dir(draft_id, project_name=None):
+    """Return the CapCut project folder a save would deploy to, or None if CapCut isn't installed."""
+    target_name = project_name or draft_id
+    if not target_name or target_name in ('.', '..') or os.path.basename(target_name) != target_name:
+        raise ValueError(f"Invalid project_name '{target_name}': must be a plain folder name")
+    capcut_projects_dir = get_capcut_projects_dir()
+    return os.path.join(capcut_projects_dir, target_name) if capcut_projects_dir else None
+
+def verify_deployed_media(dest_dir, build_dir, content_file):
+    """Raise if the deployed draft still points at the build folder or at media that isn't there."""
+    leftovers = find_draft_paths(dest_dir, build_dir)
+    if leftovers:
+        raise RuntimeError(f"Deployed draft still references the build folder: {leftovers[:5]}")
+    with open(os.path.join(dest_dir, content_file), "r", encoding="utf-8-sig") as f:
+        materials = json.load(f).get("materials", {})
+    media = [m for kind in ("videos", "audios") for m in materials.get(kind, [])]
+    missing = [m["path"] for m in media if m.get("path") and not os.path.isfile(m["path"])]
+    if missing:
+        raise RuntimeError(f"Deployed draft references media that does not exist: {missing}")
+    project_root = os.path.abspath(dest_dir) + os.sep
+    outside = [value for m in media for value in (m.get("path"), m.get("remote_url"))
+               if value and "://" not in value and not os.path.abspath(value).startswith(project_root)]
+    if outside:
+        raise RuntimeError(f"Deployed draft references local media outside the project: {outside}")
+
+def check_deploy_allowed(draft_id, project_name=None, auto_deploy=True, overwrite=False):
+    """Raise before any work is done if deploying would replace an existing project without overwrite."""
+    if not (auto_deploy or project_name):
+        return
+    dest_dir = get_deploy_dir(draft_id, project_name)
+    if dest_dir and os.path.exists(dest_dir) and not overwrite:
+        raise FileExistsError(
+            f"CapCut project already exists: {dest_dir}. Pass overwrite=true to replace it (the old folder is backed up first)."
+        )
+
+def save_draft_background(draft_id, draft_folder, task_id, project_name=None, auto_deploy=True, overwrite=False):
     """Background save draft to OSS and auto-deploy to CapCut desktop"""
     try:
         # Get draft information from global cache
@@ -90,7 +140,8 @@ def save_draft_background(draft_id, draft_folder, task_id, project_name=None, au
         if not os.path.exists(template_source_dir):
             raise FileNotFoundError(f"Template draft {template_dir} does not exist")
         shutil.copytree(template_source_dir, draft_dir)
-        
+        assign_new_draft_ids(draft_dir)
+
         # Update task status
         update_task_field(task_id, "message", "Updating media file metadata")
         update_task_field(task_id, "progress", 5)
@@ -249,23 +300,25 @@ def save_draft_background(draft_id, draft_folder, task_id, project_name=None, au
         # Auto-deploy to CapCut Desktop projects directory
         deployed_path = None
         if auto_deploy or project_name:
-            target_name = project_name or draft_id
-            capcut_projects_dir = None
-            if os.name == 'nt':
-                p = os.path.expandvars(r"%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft")
-                if os.path.exists(p):
-                    capcut_projects_dir = p
-            else:
-                mac_p = os.path.expanduser('~/Library/Containers/com.lemon.lvpro/Data/Documents/JianyingPro/User Data/Projects/com.lveditor.draft')
-                if os.path.exists(mac_p):
-                    capcut_projects_dir = mac_p
-
-            if capcut_projects_dir:
+            dest_dir = get_deploy_dir(draft_id, project_name)
+            if dest_dir:
                 try:
-                    dest_dir = os.path.join(capcut_projects_dir, target_name)
                     if os.path.exists(dest_dir):
-                        shutil.rmtree(dest_dir)
+                        if not overwrite:
+                            raise FileExistsError(f"CapCut project already exists: {dest_dir}; pass overwrite=true to replace it")
+                        # Never delete an existing project: move it aside so it can be restored
+                        backup_dir = os.path.join(current_dir, "capcut_backups",
+                                                  f"{os.path.basename(dest_dir)}_{time.strftime('%Y%m%d-%H%M%S')}")
+                        os.makedirs(os.path.dirname(backup_dir), exist_ok=True)
+                        shutil.move(dest_dir, backup_dir)
+                        logger.info(f"Backed up existing CapCut project {dest_dir} to {backup_dir}")
                     shutil.copytree(draft_dir, dest_dir)
+                    set_draft_meta_location(dest_dir)
+                    # Media was downloaded into the build folder; point the deployed copy at its own assets
+                    relocated = relocate_draft_paths(dest_dir, draft_dir, dest_dir)
+                    localized = localize_material_sources(dest_dir)
+                    logger.info(f"Rewrote build-folder paths in {len(relocated)} and local sources in {len(localized)} file(s) of {dest_dir}")
+                    verify_deployed_media(dest_dir, draft_dir, draft_profile.content_file)
                     # Clear any stale .locked file in destination
                     lock_f = os.path.join(dest_dir, ".locked")
                     if os.path.exists(lock_f):
@@ -274,6 +327,7 @@ def save_draft_background(draft_id, draft_folder, task_id, project_name=None, au
                     deployed_path = dest_dir
                 except Exception as ex:
                     logger.error(f"Failed to auto-deploy draft to CapCut: {str(ex)}")
+                    raise RuntimeError(f"Failed to deploy draft to CapCut: {ex}") from ex
 
         return draft_url if IS_UPLOAD_DRAFT else (deployed_path or draft_dir)
 
@@ -288,19 +342,25 @@ def save_draft_background(draft_id, draft_folder, task_id, project_name=None, au
 def query_task_status(task_id: str):
     return get_task_status(task_id)
 
-def save_draft_impl(draft_id: str, draft_folder: str = None, project_name: str = None, auto_deploy: bool = True) -> Dict[str, str]:
+def save_draft_impl(draft_id: str, draft_folder: str = None, project_name: str = None, auto_deploy: bool = True, overwrite: bool = False) -> Dict[str, str]:
     """Start a background task to save the draft"""
-    logger.info(f"Received save draft request: draft_id={draft_id}, draft_folder={draft_folder}, project_name={project_name}, auto_deploy={auto_deploy}")
+    logger.info(f"Received save draft request: draft_id={draft_id}, draft_folder={draft_folder}, project_name={project_name}, auto_deploy={auto_deploy}, overwrite={overwrite}")
     try:
+        check_deploy_allowed(draft_id, project_name, auto_deploy, overwrite)
+
         # Generate a unique task ID
         task_id = draft_id
         create_task(task_id)
         logger.info(f"Task {task_id} has been created.")
         
         # Changed to synchronous execution
+        draft_url = save_draft_background(draft_id, draft_folder, task_id, project_name=project_name, auto_deploy=auto_deploy, overwrite=overwrite)
+        status = get_task_status(task_id) or {}
+        if status.get("status") == "failed":
+            return {"success": False, "error": status.get("message", "Failed to save draft")}
         return {
             "success": True,
-            "draft_url": save_draft_background(draft_id, draft_folder, task_id, project_name=project_name, auto_deploy=auto_deploy)
+            "draft_url": draft_url
             }
 
         # # Start a background thread to execute the task
@@ -611,7 +671,8 @@ def download_script(draft_id: str, draft_folder: str = None, script_data: Dict =
 
     # Copy draft folder
     shutil.copytree(template_path, new_draft_path)
-    
+    assign_new_draft_ids(new_draft_path)
+
     try:
         # 1. Fetch the script from the remote endpoint
         if script_data is None:
