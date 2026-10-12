@@ -247,12 +247,17 @@ TOOLS = [
     },
     {
         "name": "save_draft",
-        "description": "保存草稿",
+        "description": "保存草稿，并部署到 CapCut 项目文件夹",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "draft_id": {"type": "string", "description": "草稿ID"}
-            }
+                "draft_id": {"type": "string", "description": "草稿ID"},
+                "project_name": {"type": "string", "description": "部署到 CapCut 的项目名称（纯文件夹名）；已存在时需 overwrite"},
+                "overwrite": {"type": "boolean", "default": False, "description": "替换已存在的项目；旧项目移到 capcut_backups/，不删除。仅在用户明确要求时使用"},
+                "auto_deploy": {"type": "boolean", "default": True, "description": "是否部署到 CapCut 项目文件夹；未提供 project_name 时以草稿ID命名"},
+                "draft_folder": {"type": "string", "description": "草稿构建文件夹路径（可选）"}
+            },
+            "required": ["draft_id"]
         }
     }
 ]
@@ -345,11 +350,19 @@ def execute_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
                 result = {"duration": duration}
                 
             elif tool_name == "save_draft":
-                save_result = save_draft_impl(**arguments)
-                if isinstance(save_result, dict) and "draft_url" in save_result:
-                    result = {"draft_url": save_result["draft_url"]}
-                else:
-                    result = {"draft_url": f"https://www.install-ai-guider.top/draft/downloader?draft_id=unknown"}
+                if not arguments.get("draft_id"):
+                    return {"success": False, "error": "Missing required parameter: draft_id"}
+                save_result = save_draft_impl(
+                    arguments["draft_id"],
+                    arguments.get("draft_folder"),
+                    project_name=arguments.get("project_name"),
+                    auto_deploy=arguments.get("auto_deploy", True),
+                    # Same rule as the REST route: only a boolean true replaces an existing project
+                    overwrite=arguments.get("overwrite", False) is True,
+                )
+                if not save_result.get("success"):
+                    return {"success": False, "error": save_result.get("error", "Failed to save draft")}
+                result = {"draft_url": save_result["draft_url"]}
                 
             else:
                 return {"success": False, "error": f"Unknown tool: {tool_name}"}
