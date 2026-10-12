@@ -27,7 +27,8 @@ from add_text_impl import add_text_impl
 from add_subtitle_impl import add_subtitle_impl
 from add_image_impl import add_image_impl
 from add_video_keyframe_impl import add_video_keyframe_impl
-from save_draft_impl import save_draft_impl, query_task_status, query_script_impl
+from save_draft_impl import save_draft_impl, query_task_status, query_script_impl, get_capcut_projects_dir
+from draft_profiles import resolve_main_timeline_dir
 from add_effect_impl import add_effect_impl
 from add_sticker_impl import add_sticker_impl
 from create_draft import create_draft
@@ -775,17 +776,6 @@ def query_script():
         result["error"] = error_message
         return jsonify(result)
 
-def _get_capcut_desktop_projects_dir():
-    if os.name == 'nt':
-        p = os.path.expandvars(r"%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft")
-        if os.path.exists(p):
-            return p
-    else:
-        mac_p = os.path.expanduser('~/Library/Containers/com.lemon.lvpro/Data/Documents/JianyingPro/User Data/Projects/com.lveditor.draft')
-        if os.path.exists(mac_p):
-            return mac_p
-    return None
-
 @app.route('/save_draft', methods=['POST'])
 def save_draft():
     data = request.get_json() or {}
@@ -796,7 +786,8 @@ def save_draft():
     project_name = data.get('project_name')
     auto_deploy = data.get('auto_deploy', True)
     auto_reload = data.get('auto_reload', False)
-    
+    overwrite = data.get('overwrite', False) is True  # only a JSON true replaces an existing project
+
     result = {
         "success": False,
         "output": "",
@@ -811,8 +802,11 @@ def save_draft():
     
     try:
         # Call save_draft_impl method
-        draft_result = save_draft_impl(draft_id, draft_folder, project_name=project_name, auto_deploy=auto_deploy)
-        
+        draft_result = save_draft_impl(draft_id, draft_folder, project_name=project_name, auto_deploy=auto_deploy, overwrite=overwrite)
+        if not draft_result.get("success"):
+            result["error"] = draft_result.get("error", "Failed to save draft")
+            return jsonify(result)
+
         # Broadcast live update to Web Preview Player
         broadcast_draft_update(draft_id=draft_id, action="save", project_name=project_name or draft_id)
 
@@ -840,10 +834,45 @@ def reload_desktop():
     return jsonify({"success": res.get("success", False), "output": res})
 
 
+TIMELINE_FILE_NAMES = ("draft_content.json", "draft_info.json")
+
+
+def _resolve_timeline_file(project_dir):
+    """Return the path of a project's timeline JSON, or None. Read-only.
+
+    Newer CapCut desktop builds store the timeline in draft_info.json and keep
+    one folder per timeline under Timelines/, with Timelines/project.json naming
+    the main one. Older builds and JianYing use draft_content.json.
+    """
+    search_dirs = []
+    main_timeline_dir = resolve_main_timeline_dir(project_dir)
+    if main_timeline_dir is not None:
+        search_dirs.append(str(main_timeline_dir))
+    search_dirs.append(project_dir)
+
+    for d in search_dirs:
+        for name in TIMELINE_FILE_NAMES:
+            path = os.path.join(d, name)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def _timeline_has_tracks(timeline_file):
+    if not timeline_file:
+        return False
+    try:
+        with open(timeline_file, "r", encoding="utf-8-sig") as f:
+            tracks = json.load(f).get("tracks")
+        return isinstance(tracks, list) and len(tracks) > 0
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 @app.route('/list_projects', methods=['GET', 'POST'])
 def list_projects():
     try:
-        proj_dir = _get_capcut_desktop_projects_dir()
+        proj_dir = get_capcut_projects_dir()
         if not proj_dir or not os.path.exists(proj_dir):
             return jsonify({"success": True, "output": {"projects": [], "message": "CapCut directory not found"}})
         
@@ -851,14 +880,15 @@ def list_projects():
         for item in os.listdir(proj_dir):
             item_path = os.path.join(proj_dir, item)
             if os.path.isdir(item_path) and not item.startswith('.'):
-                content_path = os.path.join(item_path, "draft_content.json")
+                timeline_file = _resolve_timeline_file(item_path)
                 is_locked = os.path.exists(os.path.join(item_path, ".locked"))
                 mtime = os.path.getmtime(item_path)
                 projects.append({
                     "name": item,
                     "path": item_path,
                     "is_locked": is_locked,
-                    "has_draft_content": os.path.exists(content_path),
+                    "has_draft_content": _timeline_has_tracks(timeline_file),
+                    "timeline_file": timeline_file,
                     "modified_time": datetime.fromtimestamp(mtime).isoformat()
                 })
         projects.sort(key=lambda x: x["modified_time"], reverse=True)
@@ -873,24 +903,18 @@ def read_project():
     if not project_name:
         return jsonify({"success": False, "error": "Missing project_name parameter"})
     
-    proj_dir = _get_capcut_desktop_projects_dir()
+    proj_dir = get_capcut_projects_dir()
     target_dir = os.path.join(proj_dir, project_name) if (proj_dir and not os.path.isabs(project_name)) else project_name
 
     if not os.path.exists(target_dir):
         return jsonify({"success": False, "error": f"Project path does not exist: {target_dir}"})
 
-    content_file = os.path.join(target_dir, "draft_content.json")
-    timelines_dir = os.path.join(target_dir, "Timelines")
-    if os.path.exists(timelines_dir):
-        subdirs = [os.path.join(timelines_dir, d) for d in os.listdir(timelines_dir) if os.path.isdir(os.path.join(timelines_dir, d))]
-        if subdirs and os.path.exists(os.path.join(subdirs[0], "draft_content.json")):
-            content_file = os.path.join(subdirs[0], "draft_content.json")
-
-    if not os.path.exists(content_file):
-        return jsonify({"success": False, "error": f"draft_content.json not found in {target_dir}"})
+    content_file = _resolve_timeline_file(target_dir)
+    if not content_file:
+        return jsonify({"success": False, "error": f"No timeline file (draft_content.json or draft_info.json) found in {target_dir}"})
 
     try:
-        with open(content_file, "r", encoding="utf-8") as f:
+        with open(content_file, "r", encoding="utf-8-sig") as f:
             draft_data = json.load(f)
 
         return jsonify({
@@ -898,6 +922,7 @@ def read_project():
             "output": {
                 "project_name": os.path.basename(target_dir),
                 "path": target_dir,
+                "timeline_file": content_file,
                 "duration_us": draft_data.get("duration", 0),
                 "fps": draft_data.get("fps", 30),
                 "canvas_config": draft_data.get("canvas_config", {}),

@@ -20,7 +20,7 @@ from .text_segment import Text_segment, Text_style, TextBubble, Text_border, Tex
 from .track import Track_type, Base_track, Track
 
 from settings.local import IS_CAPCUT_ENV
-from draft_profiles import get_draft_profile
+from draft_profiles import get_draft_profile, new_draft_id
 from .metadata import Video_scene_effect_type, Video_character_effect_type, Filter_type, Font_type
 
 class Script_material:
@@ -209,6 +209,9 @@ class Script_file:
 
         with open(os.path.join(os.path.dirname(__file__), self.TEMPLATE_FILE), "r", encoding="utf-8") as f:
             self.content = json.load(f)
+        # The template carries a fixed id; each new draft needs its own timeline id.
+        # load_template() replaces content afterwards, so existing drafts keep theirs.
+        self.content["id"] = new_draft_id()
 
     @staticmethod
     def load_template(json_path: str) -> "Script_file":
